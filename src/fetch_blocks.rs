@@ -685,19 +685,159 @@ mod tests {
         assert!(read_frame(&mut std::io::Cursor::new(wire), 0xDAB5BFFA).is_err());
     }
 
-    /// The rule `rust-bitcoin` does not have, which is the whole reason the
-    /// proxy does its own witness check. Kept here, pointed at `AnyBlock`,
-    /// because the check moved there when blocks stopped being `bitcoin::Block`.
+    /// A commitment nobody could have produced is still refused. The block
+    /// says witness data exists and hands over a value that does not describe
+    /// the transactions it carries.
     #[test]
-    fn a_block_that_commits_to_witnesses_must_carry_them() {
-        let stripped = block(true, false);
-        // rust-bitcoin is satisfied by this block. That is the problem.
-        assert!(stripped.check_witness_commitment());
-        assert!(!AnyBlock::from(stripped).check_witnesses());
+    fn a_commitment_that_does_not_describe_the_block_is_refused() {
+        // `block` writes a fixed 0x11.. commitment, which no real merkle root
+        // reproduces.
+        assert!(!AnyBlock::from(block(true, false)).check_witnesses());
     }
 
     #[test]
     fn a_block_with_no_commitment_needs_no_witnesses() {
         assert!(AnyBlock::from(block(false, false)).check_witnesses());
+    }
+
+    /// Witness data with nothing committing to it is not something BIP141
+    /// allows, and it is not something a peer should be able to add.
+    #[test]
+    fn witnesses_with_no_commitment_are_refused() {
+        assert!(!AnyBlock::from(block(false, true)).check_witnesses());
+    }
+
+    /// A non-coinbase transaction, optionally carrying a witness.
+    fn spending_tx(witness: bool) -> Transaction {
+        Transaction {
+            version: 1,
+            lock_time: bitcoin::PackedLockTime(0),
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: Script::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: if witness {
+                    bitcoin::Witness::from_vec(vec![vec![0xab; 71], vec![0xcd; 33]])
+                } else {
+                    bitcoin::Witness::default()
+                },
+            }],
+            output: vec![TxOut {
+                value: 1,
+                script_pubkey: Script::from(vec![0x51]),
+            }],
+        }
+    }
+
+    /// A block whose coinbase commits to exactly the witnesses it carries.
+    ///
+    /// `reserved` picks the salt shape: `Some(v)` puts a 32-byte reserved value
+    /// in the coinbase witness, and `None` leaves the coinbase witness empty,
+    /// which is the shape mainnet blocks mined during SegWit signalling have.
+    fn committing_block(txs: Vec<Transaction>, reserved: Option<[u8; 32]>) -> Block {
+        let salt = reserved.unwrap_or([0u8; 32]);
+        let root = bitcoin::util::hash::bitcoin_merkle_root(
+            std::iter::once(bitcoin::Wtxid::all_zeros().as_hash())
+                .chain(txs.iter().map(|t| t.wtxid().as_hash())),
+        )
+        .expect("a root");
+        let commitment = {
+            use bitcoin::consensus::Encodable;
+            use bitcoin::hashes::HashEngine;
+            let mut engine = bitcoin::hash_types::WitnessCommitment::engine();
+            bitcoin::WitnessMerkleNode::from(root)
+                .consensus_encode(&mut engine)
+                .expect("engines do not error");
+            engine.input(&salt);
+            bitcoin::hash_types::WitnessCommitment::from_engine(engine)
+        };
+        let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        spk.extend_from_slice(&commitment.into_inner());
+
+        let coinbase = Transaction {
+            version: 1,
+            lock_time: bitcoin::PackedLockTime(0),
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from(vec![0x51, 0x51]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: match reserved {
+                    Some(v) => bitcoin::Witness::from_vec(vec![v.to_vec()]),
+                    None => bitcoin::Witness::default(),
+                },
+            }],
+            output: vec![
+                TxOut {
+                    value: 0,
+                    script_pubkey: Script::from(vec![0x51]),
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: Script::from(spk),
+                },
+            ],
+        };
+        let mut txdata = vec![coinbase];
+        txdata.extend(txs);
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: bitcoin::BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            txdata,
+        }
+    }
+
+    /// The shape of mainnet 434499: a witness commitment in the coinbase, no
+    /// witness data anywhere, and no reserved value, because SegWit had not
+    /// activated when it was mined. Rejecting this on sight is what stopped a
+    /// pruned index dead at that height, since every peer returns the same
+    /// bytes and so every peer appears to fail.
+    #[test]
+    fn a_signalling_era_block_that_commits_but_carries_nothing_is_accepted() {
+        let b = committing_block(vec![spending_tx(false)], None);
+        assert!(
+            AnyBlock::from(b).check_witnesses(),
+            "a block mined during SegWit signalling must be fetchable"
+        );
+    }
+
+    /// The rule `rust-bitcoin` does not have, which is the whole reason the
+    /// proxy does its own witness check: a peer that removes witness data the
+    /// block commits to must still be caught. It is caught now by the
+    /// commitment failing to reproduce rather than by the block's shape.
+    ///
+    /// The reserved value here is the all-zero one, so stripping leaves the
+    /// salt unchanged. That makes the wtxid root the only thing that can catch
+    /// the peer, which is exactly what needs proving.
+    #[test]
+    fn a_peer_that_strips_committed_witnesses_is_still_caught() {
+        let honest = committing_block(vec![spending_tx(true)], Some([0u8; 32]));
+        assert!(
+            AnyBlock::from(honest.clone()).check_witnesses(),
+            "the honest block verifies"
+        );
+
+        // What a peer serving the witness-stripped serialization returns: no
+        // witnesses at all, the coinbase reserved value included.
+        let mut stripped = honest;
+        for tx in stripped.txdata.iter_mut() {
+            for input in tx.input.iter_mut() {
+                input.witness = bitcoin::Witness::default();
+            }
+        }
+        // rust-bitcoin is satisfied by this block. That is the problem.
+        assert!(stripped.check_witness_commitment());
+        assert!(
+            !AnyBlock::from(stripped).check_witnesses(),
+            "a stripped block must not pass"
+        );
     }
 }
