@@ -202,41 +202,54 @@ impl AnyBlock {
     /// `Block::check_witness_commitment` returns true for any block carrying no
     /// witnesses at all, because BIP141 makes the commitment optional in that
     /// case. A peer that strips witness data produces exactly that shape, so
-    /// the check passes on a block that has been quietly mutilated. A
-    /// commitment in the coinbase is the block's own statement that witness
-    /// data exists, so "commits but carries none" is rejected here.
+    /// the check passes on a block that has been quietly mutilated.
     ///
-    /// This is the same rule the proxy already applied to v1 blocks; it is
-    /// reimplemented over this type rather than dropped.
+    /// The defence is to verify the commitment whenever the coinbase carries
+    /// one, rather than to reject "commits but carries none" on sight.
+    /// Stripping is still caught, because the commitment covers wtxids: remove
+    /// the witnesses and every wtxid collapses onto its txid, so the root stops
+    /// reproducing what the miner committed to. Rejecting on shape alone is
+    /// what throws out real blocks; see `check_witness_commitment`.
     pub fn check_witnesses(&self) -> bool {
         let commits = self.txdata.first().map_or(false, |coinbase| {
             coinbase.output.iter().any(|o| {
                 o.script_pubkey.len() >= 38 && o.script_pubkey.as_bytes()[..6] == COMMITMENT_MAGIC
             })
         });
-        let carries = self
-            .txdata
-            .iter()
-            .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
-        if !(carries || !commits) {
-            return false;
+        if !commits {
+            // Nothing to verify against. BIP141 requires a commitment from any
+            // block carrying witness data, so witnesses without one are wrong;
+            // no witnesses and no commitment is simply a pre-SegWit block.
+            return !self
+                .txdata
+                .iter()
+                .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
         }
         self.check_witness_commitment()
     }
 
-    /// Mirrors `Block::check_witness_commitment`, over a header of either size.
+    /// Mirrors `Block::check_witness_commitment`, over a header of either size,
+    /// with two differences: it does not wave through a block that carries no
+    /// witnesses, and it tolerates a coinbase carrying no witness at all.
+    ///
+    /// BIP141 has the coinbase hold the 32-byte reserved value the commitment
+    /// is salted with, but that only became a consensus rule when SegWit
+    /// activated. Blocks mined during the signalling period carry the
+    /// commitment output with no coinbase witness behind it, and they are
+    /// valid and on mainnet. 434499 is one, and rejecting it is where a pruned
+    /// node's block fetch stops dead: every peer returns the same block, so
+    /// every peer "fails", and the index can never pass that height. Those
+    /// miners salted with 32 zero bytes, which is what a missing reserved
+    /// value means here.
+    ///
+    /// This does not soften the stripping check. The root is computed over the
+    /// wtxids actually present, so a block whose witnesses were removed stops
+    /// reproducing the miner's commitment whatever the salt.
     ///
     /// The computation is entirely about the transaction list, so nothing in it
     /// is v2-specific; it needs reimplementing only because it hangs off
     /// `Block`, which cannot hold a 164-byte header.
     fn check_witness_commitment(&self) -> bool {
-        if self
-            .txdata
-            .iter()
-            .all(|t| t.input.iter().all(|i| i.witness.is_empty()))
-        {
-            return true;
-        }
         let coinbase = match self.txdata.first() {
             Some(cb) if cb.is_coin_base() => cb,
             _ => return false,
@@ -260,10 +273,16 @@ impl AnyBlock {
             Some(root) => root,
             None => return false,
         };
+        // A coinbase with no witness at all is the signalling-period shape
+        // described above, and salts with zeros. Anything other than a single
+        // 32-byte item is malformed and stays rejected.
+        const ZERO_RESERVED: [u8; 32] = [0u8; 32];
         let witness_vec: Vec<_> = coinbase.input[0].witness.iter().collect();
-        if witness_vec.len() != 1 || witness_vec[0].len() != 32 {
-            return false;
-        }
+        let reserved: &[u8] = match witness_vec.len() {
+            0 => &ZERO_RESERVED,
+            1 if witness_vec[0].len() == 32 => witness_vec[0],
+            _ => return false,
+        };
         let expected = {
             use bitcoin::consensus::Encodable;
             use bitcoin::hashes::HashEngine;
@@ -271,7 +290,7 @@ impl AnyBlock {
             bitcoin::WitnessMerkleNode::from(commitment)
                 .consensus_encode(&mut engine)
                 .expect("engines do not error");
-            engine.input(witness_vec[0]);
+            engine.input(reserved);
             bitcoin::hash_types::WitnessCommitment::from_engine(engine)
         };
         let found = match bitcoin::hash_types::WitnessCommitment::from_slice(

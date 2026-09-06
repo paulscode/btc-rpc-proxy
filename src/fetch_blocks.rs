@@ -684,15 +684,14 @@ mod tests {
         assert!(read_frame(&mut std::io::Cursor::new(wire), 0xDAB5BFFA).is_err());
     }
 
-    /// The rule `rust-bitcoin` does not have, which is the whole reason the
-    /// proxy does its own witness check. Kept here, pointed at `AnyBlock`,
-    /// because the check moved there when blocks stopped being `bitcoin::Block`.
+    /// A commitment nobody could have produced is still refused. The block
+    /// says witness data exists and hands over a value that does not describe
+    /// the transactions it carries.
     #[test]
-    fn a_block_that_commits_to_witnesses_must_carry_them() {
-        let stripped = block(true, false);
-        // rust-bitcoin is satisfied by this block. That is the problem.
-        assert!(stripped.check_witness_commitment());
-        assert!(!AnyBlock::from(stripped).check_witnesses());
+    fn a_commitment_that_does_not_describe_the_block_is_refused() {
+        // `block` writes a fixed 0x11.. commitment, which no real merkle root
+        // reproduces.
+        assert!(!AnyBlock::from(block(true, false)).check_witnesses());
     }
 
     #[test]
