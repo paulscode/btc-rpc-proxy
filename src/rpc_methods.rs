@@ -94,7 +94,25 @@ pub struct GetBlockHeaderResult {
     pub mediantime: Option<usize>,
     pub nonce: u32,
     pub bits: String,
-    pub difficulty: f64,
+    /// Optional since Bitcoin Knots 29.4.2.knots20260508 (knots#420), which stopped
+    /// reporting it for header-v2 blocks on the grounds that a BLAKE2b difficulty and
+    /// a SHA256d one are different units. On a BLAKE2b chain that is every block above
+    /// the activation, so as a required field this could not parse a header at all.
+    /// Skipped when absent rather than serialized as null, because this struct is
+    /// re-serialized to the client when a pruned block is rebuilt and a null where the
+    /// node sent nothing is a third shape nobody asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<f64>,
+    /// What knots#420 reports in its place, carried so a client sees what the node
+    /// actually said. Fields absent from this struct are dropped on the way back out.
+    /// Named explicitly: this struct is `rename_all = "camelCase"`, and the node
+    /// sends `difficulty_blake2b`, not `difficultyBlake2b`.
+    #[serde(
+        rename = "difficulty_blake2b",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub difficulty_blake2b: Option<f64>,
     pub chainwork: HexBytes,
     pub n_tx: usize,
     pub previousblockhash: Option<bitcoin::BlockHash>,
@@ -421,6 +439,41 @@ mod tests {
         .expect("failed to parse");
         assert_eq!(info.chain, "testnet4");
         assert!(info.signet_challenge.is_none());
+    }
+
+    /// Knots 29.4.2.knots20260508 (knots#420) reports `difficulty_blake2b` for a
+    /// header-v2 block and omits `difficulty`. As a required field this could not
+    /// parse a single header on a BLAKE2b chain, and the proxy is in the RPC path
+    /// for every pruned node here.
+    #[test]
+    fn parses_a_header_without_difficulty() {
+        let header: super::GetBlockHeaderResult = serde_json::from_str(
+            r#"{
+              "hash": "0000000000000000a56a915d40e037c745b3c85b128b46a66d924468cbee43b9",
+              "confirmations": 1,
+              "height": 973329,
+              "version": -1610612736,
+              "versionHex": "a0000000",
+              "merkleroot": "578e22da1ca66f343029c9e95afa42e8ea34e1c407c57cb2f3e87f0073ae9362",
+              "time": 1758430000,
+              "mediantime": 1758429000,
+              "nonce": 1,
+              "bits": "1d00ffff",
+              "difficulty_blake2b": 1234.5,
+              "chainwork": "0000000000000000000000000000000000000000000000000000000100010001",
+              "nTx": 244
+            }"#,
+        )
+        .expect("a header-v2 block reports no difficulty");
+        assert_eq!(header.height, 973329);
+        assert!(header.difficulty.is_none());
+        assert_eq!(header.difficulty_blake2b, Some(1234.5));
+
+        // Re-serialized back to a client, neither field becomes an unasked-for null,
+        // and the one the node did send survives the round trip.
+        let out = serde_json::to_value(&header).expect("serializes");
+        assert!(out.get("difficulty").is_none());
+        assert_eq!(out.get("difficulty_blake2b").and_then(|v| v.as_f64()), Some(1234.5));
     }
 
     /// Core reports -1 confirmations for a header that is not on the main
