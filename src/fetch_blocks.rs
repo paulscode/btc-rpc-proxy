@@ -19,6 +19,7 @@ use bitcoin::{
 use futures::FutureExt;
 use hyper::body::Bytes;
 use socks::Socks5Stream;
+use tokio::sync::broadcast;
 
 use crate::client::{
     ClientError, RpcClient, RpcError, RpcRequest, MISC_ERROR_CODE, PRUNE_ERROR_MESSAGE,
@@ -501,6 +502,21 @@ pub async fn fetch_block_raw(
     if let Some(block) = fetch_block_from_self(&*state, hash).await? {
         return Ok(Some(block));
     }
+
+    // Everything below is the peer fetch, which is the slow and cancellable part. `SingleFlight`
+    // runs it as a task of its own: a caller whose HTTP connection goes away must not discard a
+    // fetch that is nearly done, and two callers wanting the same block must not both go to the
+    // network for it.
+    let task_state = state.clone();
+    Ok(state
+        .in_flight
+        .run(hash, move || fetch_block_from_peers_and_cache(task_state, hash))
+        .await
+        .flatten())
+}
+
+/// The peer fetch proper, as run by the spawned task in `fetch_block_raw`.
+async fn fetch_block_from_peers_and_cache(state: Arc<State>, hash: BlockHash) -> Option<Bytes> {
     debug!(
         state.logger,
         "Block is pruned from Core, attempting fetch from peers.";
@@ -508,20 +524,28 @@ pub async fn fetch_block_raw(
     );
     // Resolved here rather than by the caller so that a failure to enumerate
     // peers can only ever affect blocks Core no longer has.
-    let peers = state.clone().get_peers().await?;
+    let peers = match state.clone().get_peers().await {
+        Ok(peers) => peers,
+        Err(e) => {
+            error!(state.logger, "Could not enumerate peers."; "block_hash" => %hash, "error" => ?e);
+            return None;
+        }
+    };
     let block = match fetch_block_from_peers(state.clone(), peers, hash).await {
         Some(block) => block,
         None => {
             error!(state.logger, "Could not fetch block from peers."; "block_hash" => %hash);
-            return Ok(None);
+            return None;
         }
     };
     // The bytes the peer sent, which are the bytes that were verified. Serving
     // a re-serialization would risk handing back something subtly different
     // from what the hash, merkle and witness checks actually ran against.
     let serialized = Bytes::from(block.raw().to_vec());
+    // Written before the result is published, so a caller that hung up still leaves the block here
+    // for whoever asks next.
     state.block_cache.insert(hash, serialized.clone());
-    Ok(Some(serialized))
+    Some(serialized)
 }
 
 pub async fn fetch_block(state: Arc<State>, hash: BlockHash) -> Result<Option<AnyBlock>, RpcError> {

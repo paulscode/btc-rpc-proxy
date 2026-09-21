@@ -3,12 +3,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Error;
+use hyper::body::Bytes;
 use bitcoin::consensus::encode::{Encodable, VarInt};
 use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::BlockHash;
 use slog::Logger;
 use tokio::sync::{OnceCell, RwLock};
 
 use crate::block_cache::BlockCache;
+use crate::single_flight::SingleFlight;
 use crate::client::{RpcClient, RpcRequest};
 use crate::fetch_blocks::{PeerHandle, Peers};
 use crate::rpc_methods::{BlockchainInfo, GetBlockchainInfo};
@@ -106,6 +109,15 @@ pub struct State {
     pub network: OnceCell<NetworkParams>,
     /// Blocks fetched from peers, so the same one is not pulled twice.
     pub block_cache: BlockCache,
+    /// Peer fetches currently running, keyed by the block being fetched.
+    ///
+    /// Two things depend on this. A fetch is spawned rather than awaited inline, so a caller that
+    /// hangs up mid-fetch no longer throws the work away: the task runs on and fills
+    /// `block_cache`, turning a request that used to fail forever into one that fails once and is
+    /// served from cache on the retry. And a second caller asking for a block already in flight
+    /// waits on the same result instead of opening its own peer connections, which matters now
+    /// that a client can ask for several blocks at once.
+    pub in_flight: Arc<SingleFlight<BlockHash, Option<Bytes>>>,
 }
 impl State {
     pub fn leak(self) -> &'static Self {

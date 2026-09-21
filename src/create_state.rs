@@ -148,6 +148,7 @@ pub fn create_state() -> Result<(State, SocketAddr), Error> {
             // panics at startup. Saturating gives "as much as this machine
             // could address", which is the honest reading of an absurd number.
             block_cache: BlockCache::new(config.block_cache_size_mib.saturating_mul(1024 * 1024)),
+            in_flight: Default::default(),
         },
         bind_addr,
     ))

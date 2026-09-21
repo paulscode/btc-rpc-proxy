@@ -8,6 +8,7 @@ pub mod fetch_blocks;
 pub mod header_v2;
 pub mod proxy;
 pub mod rpc_methods;
+pub mod single_flight;
 pub mod state;
 pub mod users;
 pub mod util;
