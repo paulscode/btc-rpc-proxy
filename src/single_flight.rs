@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 /// Runs one piece of work per key, detached from whoever asked for it.
 ///
@@ -30,7 +30,39 @@ impl<K, V> std::fmt::Debug for SingleFlight<K, V> {
 }
 
 pub struct SingleFlight<K, V> {
+    // A plain mutex, not an async one: nothing in any critical section below awaits, and a
+    // blocking guard is what lets the key be released from `Drop` when a task unwinds.
     in_flight: Mutex<HashMap<K, broadcast::Sender<V>>>,
+}
+
+/// Releases a key however the task holding it ends, including by panicking.
+///
+/// Without this a panic anywhere in `work` would leave the key in the map, and the map holds a
+/// *clone* of the sender. The task's own copy drops as it unwinds, but the map's does not, so the
+/// channel never closes: every later caller for that key finds the entry, subscribes, and then
+/// waits on it **forever** rather than being told anything. Measured by neutering this guard --
+/// the test below stops failing and starts hanging.
+///
+/// One panic would therefore cost one block, permanently and silently, for the life of the
+/// process. Too wide a gap between cause and effect to leave open, with the work driven by bytes
+/// from peers.
+struct ReleaseOnDrop<K: Eq + Hash, V> {
+    flight: Arc<SingleFlight<K, V>>,
+    key: Option<K>,
+}
+
+impl<K: Eq + Hash, V> Drop for ReleaseOnDrop<K, V> {
+    fn drop(&mut self) {
+        // `Some` only when the task did not publish, so this never removes an entry a later run
+        // put there: the publishing path takes the key out of the guard under the same lock.
+        if let Some(key) = self.key.take() {
+            self.flight
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+        }
+    }
 }
 
 impl<K, V> Default for SingleFlight<K, V> {
@@ -58,7 +90,7 @@ where
         Fut: Future<Output = V> + Send,
     {
         let mut receiver = {
-            let mut in_flight = self.in_flight.lock().await;
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
             match in_flight.get(&key) {
                 Some(sender) => sender.subscribe(),
                 None => {
@@ -66,8 +98,12 @@ where
                     let (sender, receiver) = broadcast::channel(1);
                     in_flight.insert(key.clone(), sender.clone());
                     let this = Arc::clone(self);
-                    let task_key = key.clone();
+                    let task_key = Some(key.clone());
                     tokio::spawn(async move {
+                        let mut release = ReleaseOnDrop {
+                            flight: Arc::clone(&this),
+                            key: task_key,
+                        };
                         let value = work().await;
                         // Publish and release the key under one lock, so a caller either finds the
                         // key before the value is published and receives it, or finds no key and
@@ -77,9 +113,12 @@ where
                         // subscribed. That is not theoretical — on a multi-threaded runtime it hit
                         // ~2.5% of callers under contention, each of them told the block could not
                         // be fetched when it had in fact just been fetched successfully.
-                        let mut in_flight = this.in_flight.lock().await;
+                        let mut in_flight =
+                            this.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
                         let _ = sender.send(value);
-                        in_flight.remove(&task_key);
+                        if let Some(key) = release.key.take() {
+                            in_flight.remove(&key);
+                        }
                     });
                     receiver
                 }
@@ -90,8 +129,11 @@ where
     }
 
     /// How many pieces of work are running. For tests and for reporting.
-    pub async fn len(&self) -> usize {
-        self.in_flight.lock().await.len()
+    pub fn len(&self) -> usize {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -196,6 +238,41 @@ mod tests {
         assert_eq!(n, 0, "{} callers were told the work failed when it had not", n);
     }
 
+    /// A run whose work panics must still release its key.
+    ///
+    /// The caller seeing `None` is honest -- no value was produced. What must not happen is the
+    /// key being left in the map. The map holds a clone of the sender, so the channel would never
+    /// close, and the second call below would not fail but hang: the failure mode is a wedged
+    /// caller, not an error. Neuter `ReleaseOnDrop` and this test stops finishing at all.
+    ///
+    /// The panic is inside a spawned task, so tokio logs it and the test itself survives; the
+    /// noise in the output is expected.
+    #[tokio::test]
+    async fn a_run_whose_work_panics_releases_its_key() {
+        let flight: Arc<SingleFlight<u8, u8>> = Arc::default();
+
+        assert_eq!(
+            flight.run(5, || async { panic!("work blew up") }).await,
+            None,
+            "nothing was produced, so there is nothing to hand back"
+        );
+
+        // The release happens as the task unwinds, so allow it to be scheduled.
+        for _ in 0..100 {
+            if flight.len() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(flight.len(), 0, "a panicking run must not keep its key");
+
+        assert_eq!(
+            flight.run(5, || async { 7 }).await,
+            Some(7),
+            "and the next caller for it gets a real answer rather than a dead channel"
+        );
+    }
+
     /// Different keys do not share, or one slow block would hold up every other.
     #[tokio::test]
     async fn different_keys_run_separately() {
@@ -226,12 +303,12 @@ mod tests {
 
         // The removal happens in the task just after publishing, so allow it to be scheduled.
         for _ in 0..100 {
-            if flight.len().await == 0 {
+            if flight.len() == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        assert_eq!(flight.len().await, 0, "the key should not be held");
+        assert_eq!(flight.len(), 0, "the key should not be held");
 
         // And a second run genuinely re-runs rather than hanging.
         assert_eq!(flight.run(3, || async { 2 }).await, Some(2));
