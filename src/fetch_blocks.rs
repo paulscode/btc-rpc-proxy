@@ -19,7 +19,6 @@ use bitcoin::{
 use futures::FutureExt;
 use hyper::body::Bytes;
 use socks::Socks5Stream;
-use tokio::sync::broadcast;
 
 use crate::client::{
     ClientError, RpcClient, RpcError, RpcRequest, MISC_ERROR_CODE, PRUNE_ERROR_MESSAGE,

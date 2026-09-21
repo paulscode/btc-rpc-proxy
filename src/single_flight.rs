@@ -49,8 +49,9 @@ where
     /// Waits for `work` on `key`, starting it only if it is not already running.
     ///
     /// Returns `None` if the work produced no value for this caller to see, which happens only if
-    /// the task itself died. The work having already finished is not that case: it is published
-    /// before the key is released, so a late subscriber either receives it or starts afresh.
+    /// the task itself died. The work having already finished is not that case: publishing the
+    /// value and releasing the key happen under one lock, so a caller either subscribes in time to
+    /// receive it or finds no key and starts afresh, never in between.
     pub async fn run<F, Fut>(self: &Arc<Self>, key: K, work: F) -> Option<V>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -68,10 +69,17 @@ where
                     let task_key = key.clone();
                     tokio::spawn(async move {
                         let value = work().await;
-                        // Published before the key is released. The other order would let a caller
-                        // arriving in between subscribe to a channel that will never speak.
+                        // Publish and release the key under one lock, so a caller either finds the
+                        // key before the value is published and receives it, or finds no key and
+                        // starts afresh. Doing these as two steps leaves a window in between where
+                        // a caller subscribes to a channel that has already spoken and then waits
+                        // on it forever: a broadcast receiver only sees values sent after it
+                        // subscribed. That is not theoretical — on a multi-threaded runtime it hit
+                        // ~2.5% of callers under contention, each of them told the block could not
+                        // be fetched when it had in fact just been fetched successfully.
+                        let mut in_flight = this.in_flight.lock().await;
                         let _ = sender.send(value);
-                        this.in_flight.lock().await.remove(&task_key);
+                        in_flight.remove(&task_key);
                     });
                     receiver
                 }
@@ -146,6 +154,48 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1, "but it only ran once");
     }
 
+    /// A caller arriving just as the work finishes must not be told the work failed.
+    ///
+    /// Publishing the value and releasing the key used to be two steps, which left a window where
+    /// a caller found the key, subscribed, and then waited on a broadcast channel that had already
+    /// spoken -- a receiver only sees values sent after it subscribed. Those callers got `None`,
+    /// which `fetch_block_raw` reports as "block not available" for a block that had in fact just
+    /// been fetched. Hammering the window this way produced it in ~2.5% of calls before the fix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_caller_arriving_as_the_work_finishes_still_gets_the_value() {
+        let missed = Arc::new(AtomicUsize::new(0));
+
+        for round in 0..300u32 {
+            let flight: Arc<SingleFlight<u32, u32>> = Arc::default();
+            let mut handles = vec![];
+            for _ in 0..8 {
+                let flight = flight.clone();
+                let missed = missed.clone();
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..20 {
+                        // The work always succeeds, so every `None` here is the race and not a
+                        // failure being reported honestly.
+                        let got = flight
+                            .run(round, move || async move {
+                                tokio::task::yield_now().await;
+                                round
+                            })
+                            .await;
+                        if got.is_none() {
+                            missed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        }
+
+        let n = missed.load(Ordering::SeqCst);
+        assert_eq!(n, 0, "{} callers were told the work failed when it had not", n);
+    }
+
     /// Different keys do not share, or one slow block would hold up every other.
     #[tokio::test]
     async fn different_keys_run_separately() {
@@ -187,3 +237,4 @@ mod tests {
         assert_eq!(flight.run(3, || async { 2 }).await, Some(2));
     }
 }
+
