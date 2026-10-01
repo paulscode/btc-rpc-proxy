@@ -142,6 +142,7 @@ impl State {
                 let info = self
                     .rpc_client
                     .call(&RpcRequest {
+                        jsonrpc: None,
                         id: None,
                         method: GetBlockchainInfo,
                         params: [],
