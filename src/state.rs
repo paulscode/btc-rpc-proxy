@@ -3,18 +3,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Error;
-use hyper::body::Bytes;
 use bitcoin::consensus::encode::{Encodable, VarInt};
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::BlockHash;
+use hyper::body::Bytes;
 use slog::Logger;
 use tokio::sync::{OnceCell, RwLock};
 
 use crate::block_cache::BlockCache;
-use crate::single_flight::SingleFlight;
 use crate::client::{RpcClient, RpcRequest};
 use crate::fetch_blocks::{PeerHandle, Peers};
 use crate::rpc_methods::{BlockchainInfo, GetBlockchainInfo};
+use crate::single_flight::SingleFlight;
 use crate::users::Users;
 
 #[derive(Debug)]

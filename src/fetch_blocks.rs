@@ -511,7 +511,9 @@ pub async fn fetch_block_raw(
     let task_state = state.clone();
     Ok(state
         .in_flight
-        .run(hash, move || fetch_block_from_peers_and_cache(task_state, hash))
+        .run(hash, move || {
+            fetch_block_from_peers_and_cache(task_state, hash)
+        })
         .await
         .flatten())
 }

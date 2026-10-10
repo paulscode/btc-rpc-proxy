@@ -21,18 +21,18 @@ use tokio::sync::broadcast;
 /// Values are published over a broadcast channel rather than returned, because there may be no
 /// receiver left by the time there is something to return, and that is the expected case rather
 /// than an error.
-impl<K, V> std::fmt::Debug for SingleFlight<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The map is behind an async lock, so its contents are not reachable from a sync
-        // formatter. The type is all `State`'s derived `Debug` needs from it.
-        f.write_str("SingleFlight")
-    }
-}
-
 pub struct SingleFlight<K, V> {
     // A plain mutex, not an async one: nothing in any critical section below awaits, and a
     // blocking guard is what lets the key be released from `Drop` when a task unwinds.
     in_flight: Mutex<HashMap<K, broadcast::Sender<V>>>,
+}
+
+impl<K, V> std::fmt::Debug for SingleFlight<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The keys in flight are not worth taking the lock for in a formatter. The type is all
+        // `State`'s derived `Debug` needs from it.
+        f.write_str("SingleFlight")
+    }
 }
 
 /// Releases a key however the task holding it ends, including by panicking.
@@ -90,7 +90,10 @@ where
         Fut: Future<Output = V> + Send,
     {
         let mut receiver = {
-            let mut in_flight = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             match in_flight.get(&key) {
                 Some(sender) => sender.subscribe(),
                 None => {
@@ -110,11 +113,13 @@ where
                         // starts afresh. Doing these as two steps leaves a window in between where
                         // a caller subscribes to a channel that has already spoken and then waits
                         // on it forever: a broadcast receiver only sees values sent after it
-                        // subscribed. That is not theoretical — on a multi-threaded runtime it hit
+                        // subscribed. That is not theoretical: on a multi-threaded runtime it hit
                         // ~2.5% of callers under contention, each of them told the block could not
                         // be fetched when it had in fact just been fetched successfully.
-                        let mut in_flight =
-                            this.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut in_flight = this
+                            .in_flight
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
                         let _ = sender.send(value);
                         if let Some(key) = release.key.take() {
                             in_flight.remove(&key);
@@ -159,11 +164,9 @@ mod tests {
             42
         });
         // Give up well before the work could finish, exactly as a timeout would.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), abandoned)
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(5), abandoned)
+            .await
+            .is_err());
 
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(ran.load(Ordering::SeqCst), 1, "the work should have run on");
@@ -235,7 +238,11 @@ mod tests {
         }
 
         let n = missed.load(Ordering::SeqCst);
-        assert_eq!(n, 0, "{} callers were told the work failed when it had not", n);
+        assert_eq!(
+            n, 0,
+            "{} callers were told the work failed when it had not",
+            n
+        );
     }
 
     /// A run whose work panics must still release its key.
@@ -314,4 +321,3 @@ mod tests {
         assert_eq!(flight.run(3, || async { 2 }).await, Some(2));
     }
 }
-
