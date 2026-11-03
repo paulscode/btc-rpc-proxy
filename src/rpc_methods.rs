@@ -309,6 +309,43 @@ impl<'de> Deserialize<'de> for GetBlockchainInfo {
     }
 }
 
+#[derive(Debug)]
+pub struct GetNetworkInfo;
+
+/// Only `localservices`. The proxy advertises the BLAKE2b service bit to peers
+/// exactly when the node itself does; see `NetworkParams::services`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct NetworkInfo {
+    /// The node's own service bits, as 16 hex digits.
+    pub localservices: String,
+}
+
+impl RpcMethod for GetNetworkInfo {
+    type Params = [(); 0];
+    type Response = NetworkInfo;
+    fn as_str(&self) -> &'static str {
+        "getnetworkinfo"
+    }
+}
+impl Serialize for GetNetworkInfo {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_str().serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for GetNetworkInfo {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s: &'de str = Deserialize::deserialize(deserializer)?;
+        if s == Self.as_str() {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(s),
+                &Self.as_str(),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BlockchainInfo, PeerInfo};

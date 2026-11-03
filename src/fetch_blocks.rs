@@ -38,18 +38,18 @@ fn ver_ack(magic: u32) -> RawNetworkMessage {
     }
 }
 
-fn version_message(magic: u32) -> RawNetworkMessage {
+fn version_message(magic: u32, services: ServiceFlags) -> RawNetworkMessage {
     use std::time::SystemTime;
     RawNetworkMessage {
         magic,
         payload: NetworkMessage::Version(VersionMessage::new(
-            ServiceFlags::NONE,
+            services,
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64,
-            bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), ServiceFlags::NONE),
-            bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), ServiceFlags::NONE),
+            bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), services),
+            bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), services),
             0,
             format!("BTC RPC Proxy v{}", env!("CARGO_PKG_VERSION")),
             0,
@@ -264,7 +264,7 @@ impl BitcoinPeerConnection {
                 if let Err(e) = stream.set_nodelay() {
                     warn!(state.logger, "failed to set TCP_NODELAY"; "error" => %e);
                 }
-                version_message(network.magic).consensus_encode(&mut stream)?;
+                version_message(network.magic, network.services).consensus_encode(&mut stream)?;
                 stream.flush()?;
                 let _ =
                     bitcoin::network::message::RawNetworkMessage::consensus_decode(&mut stream)?; // version
@@ -563,7 +563,8 @@ pub async fn fetch_block(state: Arc<State>, hash: BlockHash) -> Result<Option<An
 
 #[cfg(test)]
 mod tests {
-    use super::{read_frame, Frame};
+    use super::{read_frame, version_message, Frame};
+    use bitcoin::network::constants::ServiceFlags;
     use crate::any_block::AnyBlock;
     use bitcoin::blockdata::{
         block::{Block, BlockHeader},
@@ -674,6 +675,23 @@ mod tests {
                 assert!(b.check_merkle_root() && b.check_witnesses());
             }
             _ => panic!("expected a block frame"),
+        }
+    }
+
+    /// The handshake carries whatever services it is given, in the version
+    /// message and in the sender address both: NONE to a SHA256 node, and
+    /// NODE_BLAKE2B to a BLAKE2b one, which otherwise serves nothing past the
+    /// chain split.
+    #[test]
+    fn the_version_message_advertises_the_services_it_is_given() {
+        for services in [ServiceFlags::NONE, ServiceFlags::from(1 << 28)] {
+            match version_message(0xD9B4BEF9, services).payload {
+                NetworkMessage::Version(v) => {
+                    assert_eq!(v.services, services);
+                    assert_eq!(v.sender.services, services);
+                }
+                other => panic!("expected a version message, got {:?}", other),
+            }
         }
     }
 

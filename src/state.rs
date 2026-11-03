@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Error;
 use bitcoin::consensus::encode::{Encodable, VarInt};
 use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::network::constants::ServiceFlags;
 use bitcoin::BlockHash;
 use hyper::body::Bytes;
 use slog::Logger;
@@ -13,7 +14,7 @@ use tokio::sync::{OnceCell, RwLock};
 use crate::block_cache::BlockCache;
 use crate::client::{RpcClient, RpcRequest};
 use crate::fetch_blocks::{PeerHandle, Peers};
-use crate::rpc_methods::{BlockchainInfo, GetBlockchainInfo};
+use crate::rpc_methods::{BlockchainInfo, GetBlockchainInfo, GetNetworkInfo};
 use crate::single_flight::SingleFlight;
 use crate::users::Users;
 
@@ -33,6 +34,31 @@ pub struct NetworkParams {
     pub magic: u32,
     /// Port to assume when `getpeerinfo` reports a peer address without one.
     pub default_peer_port: u16,
+    /// What the proxy advertises in its `version` message. Knots 29.4.3 on the
+    /// BLAKE2b chain serves nothing past the chain split (block 961631) to a
+    /// peer without NODE_BLAKE2B, and silently: a `getdata` for a later block
+    /// gets no reply at all (knots 18430434ab, "Hide (approaching) BLAKE2b
+    /// blocks from stale peers"). Advertising nothing, as upstream does, left
+    /// every such block unfetchable once a node's peers had upgraded. So this
+    /// is NODE_BLAKE2B when the node itself advertises it, and NONE otherwise.
+    pub services: ServiceFlags,
+}
+
+/// NODE_BLAKE2B, the service bit a BLAKE2b-chain Knots node advertises
+/// (`protocol.h`).
+pub const NODE_BLAKE2B: u64 = 1 << 28;
+
+/// The services to advertise to peers, given the node's own `localservices`
+/// from `getnetworkinfo`: NODE_BLAKE2B if the node carries it, nothing
+/// otherwise. An unreadable value is treated as nothing, which is what the
+/// proxy advertised before, rather than failing every fetch.
+pub fn p2p_services(localservices: &str) -> Result<ServiceFlags, std::num::ParseIntError> {
+    let local = u64::from_str_radix(localservices.trim_start_matches("0x"), 16)?;
+    Ok(if local & NODE_BLAKE2B != 0 {
+        ServiceFlags::from(NODE_BLAKE2B)
+    } else {
+        ServiceFlags::NONE
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,14 +78,17 @@ impl NetworkParams {
             "main" => NetworkParams {
                 magic: 0xD9B4BEF9,
                 default_peer_port: 8333,
+                services: ServiceFlags::NONE,
             },
             "test" => NetworkParams {
                 magic: 0x0709110B,
                 default_peer_port: 18333,
+                services: ServiceFlags::NONE,
             },
             "testnet4" => NetworkParams {
                 magic: 0x283F161C,
                 default_peer_port: 48333,
+                services: ServiceFlags::NONE,
             },
             "signet" => NetworkParams {
                 magic: signet_magic(
@@ -68,10 +97,12 @@ impl NetworkParams {
                         .ok_or(NetworkError::MissingSignetChallenge)?,
                 ),
                 default_peer_port: 38333,
+                services: ServiceFlags::NONE,
             },
             "regtest" => NetworkParams {
                 magic: 0xDAB5BFFA,
                 default_peer_port: 18444,
+                services: ServiceFlags::NONE,
             },
             other => return Err(NetworkError::UnknownChain(other.to_owned())),
         })
@@ -149,11 +180,27 @@ impl State {
                     })
                     .await?
                     .into_result()?;
-                let params = NetworkParams::from_blockchain_info(&info)?;
+                let mut params = NetworkParams::from_blockchain_info(&info)?;
+                let net = self
+                    .rpc_client
+                    .call(&RpcRequest {
+                        jsonrpc: None,
+                        id: None,
+                        method: GetNetworkInfo,
+                        params: [],
+                    })
+                    .await?
+                    .into_result()?;
+                params.services = p2p_services(&net.localservices).unwrap_or_else(|e| {
+                    warn!(self.logger, "could not read the node's localservices, advertising none";
+                        "localservices" => net.localservices.as_str(), "error" => %e);
+                    ServiceFlags::NONE
+                });
                 info!(self.logger, "took p2p parameters from bitcoind";
                     "chain" => info.chain.as_str(),
                     "magic" => format!("{:08x}", params.magic),
-                    "default_peer_port" => params.default_peer_port);
+                    "default_peer_port" => params.default_peer_port,
+                    "services" => format!("{:016x}", params.services.to_u64()));
                 Ok::<_, Error>(params)
             })
             .await
@@ -185,7 +232,28 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkError, NetworkParams};
+    use super::{p2p_services, NetworkError, NetworkParams, NODE_BLAKE2B};
+    use bitcoin::network::constants::ServiceFlags;
+
+    /// The `localservices` the two chains' nodes report, from live nodes: Knots
+    /// 29.4.3 on the BLAKE2b chain, pruned, and a pruned SHA256 Knots.
+    #[test]
+    fn advertises_blake2b_exactly_when_the_node_does() {
+        assert_eq!(
+            p2p_services("0000000010000c08").unwrap(),
+            ServiceFlags::from(NODE_BLAKE2B)
+        );
+        assert_eq!(p2p_services("0000000000000c08").unwrap(), ServiceFlags::NONE);
+        assert_eq!(p2p_services("0000000000000000").unwrap(), ServiceFlags::NONE);
+        assert!(p2p_services("not hex").is_err());
+    }
+
+    /// The chain alone says nothing about the service bit; it comes from
+    /// `getnetworkinfo`, so a fresh parse starts with nothing.
+    #[test]
+    fn chain_params_start_with_no_services() {
+        assert_eq!(params(r#"{"chain":"main"}"#).unwrap().services, ServiceFlags::NONE);
+    }
     use crate::rpc_methods::BlockchainInfo;
 
     fn params(json: &str) -> Result<NetworkParams, NetworkError> {
