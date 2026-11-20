@@ -243,8 +243,14 @@ mod tests {
             p2p_services("0000000010000c08").unwrap(),
             ServiceFlags::from(NODE_BLAKE2B)
         );
-        assert_eq!(p2p_services("0000000000000c08").unwrap(), ServiceFlags::NONE);
-        assert_eq!(p2p_services("0000000000000000").unwrap(), ServiceFlags::NONE);
+        assert_eq!(
+            p2p_services("0000000000000c08").unwrap(),
+            ServiceFlags::NONE
+        );
+        assert_eq!(
+            p2p_services("0000000000000000").unwrap(),
+            ServiceFlags::NONE
+        );
         assert!(p2p_services("not hex").is_err());
     }
 
@@ -252,7 +258,10 @@ mod tests {
     /// `getnetworkinfo`, so a fresh parse starts with nothing.
     #[test]
     fn chain_params_start_with_no_services() {
-        assert_eq!(params(r#"{"chain":"main"}"#).unwrap().services, ServiceFlags::NONE);
+        assert_eq!(
+            params(r#"{"chain":"main"}"#).unwrap().services,
+            ServiceFlags::NONE
+        );
     }
     use crate::rpc_methods::BlockchainInfo;
 

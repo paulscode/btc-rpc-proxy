@@ -197,6 +197,15 @@ impl AnyBlock {
         }
     }
 
+    /// A merkle root does not tell a block from one with its trailing
+    /// transactions repeated (CVE-2012-2459), so the header, merkle and witness
+    /// checks all pass on such a block. Upstream 0.8.3's check, moved onto
+    /// `AnyBlock` so it covers both header formats.
+    pub fn has_unique_txids(&self) -> bool {
+        let mut seen = std::collections::HashSet::with_capacity(self.txdata.len());
+        self.txdata.iter().all(|tx| seen.insert(tx.txid()))
+    }
+
     /// The witness commitment check, plus the rule `rust-bitcoin` lacks.
     ///
     /// `Block::check_witness_commitment` returns true for any block carrying no

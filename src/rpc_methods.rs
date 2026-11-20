@@ -510,7 +510,10 @@ mod tests {
         // and the one the node did send survives the round trip.
         let out = serde_json::to_value(&header).expect("serializes");
         assert!(out.get("difficulty").is_none());
-        assert_eq!(out.get("difficulty_blake2b").and_then(|v| v.as_f64()), Some(1234.5));
+        assert_eq!(
+            out.get("difficulty_blake2b").and_then(|v| v.as_f64()),
+            Some(1234.5)
+        );
     }
 
     /// Core reports -1 confirmations for a header that is not on the main

@@ -51,7 +51,7 @@ fn version_message(magic: u32, services: ServiceFlags) -> RawNetworkMessage {
             bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), services),
             bitcoin::network::Address::new(&([127, 0, 0, 1], 8332).into(), services),
             0,
-            format!("BTC RPC Proxy v{}", env!("CARGO_PKG_VERSION")),
+            "/Satoshi:30.4.0/".to_owned(),
             0,
         )),
     }
@@ -401,21 +401,20 @@ async fn fetch_block_from_peer<'a>(
                     // before, over a type that can hold either format.
                     let b = AnyBlock::parse(&payload)?;
                     let returned_hash = b.block_hash();
-                    let merkle_check = b.check_merkle_root();
-                    let witness_check = b.check_witnesses();
-                    return match (returned_hash == hash, merkle_check, witness_check) {
-                        (true, true, true) => Ok((b, conn)),
-                        (true, true, false) => {
-                            Err(anyhow::anyhow!("Witness check failed for {:?}", hash))
-                        }
-                        (true, false, _) => {
-                            Err(anyhow::anyhow!("Merkle check failed for {:?}", hash))
-                        }
-                        (false, _, _) => Err(anyhow::anyhow!(
+                    return if returned_hash != hash {
+                        Err(anyhow::anyhow!(
                             "Expected block hash {:?}, got {:?}",
                             hash,
                             returned_hash
-                        )),
+                        ))
+                    } else if !b.check_merkle_root() {
+                        Err(anyhow::anyhow!("Merkle check failed for {:?}", hash))
+                    } else if !b.has_unique_txids() {
+                        Err(anyhow::anyhow!("Duplicate transactions in {:?}", hash))
+                    } else if !b.check_witnesses() {
+                        Err(anyhow::anyhow!("Witness check failed for {:?}", hash))
+                    } else {
+                        Ok((b, conn))
                     };
                 }
                 Frame::Other(m) => m,
@@ -564,7 +563,6 @@ pub async fn fetch_block(state: Arc<State>, hash: BlockHash) -> Result<Option<An
 #[cfg(test)]
 mod tests {
     use super::{read_frame, version_message, Frame};
-    use bitcoin::network::constants::ServiceFlags;
     use crate::any_block::AnyBlock;
     use bitcoin::blockdata::{
         block::{Block, BlockHeader},
@@ -572,8 +570,8 @@ mod tests {
         transaction::{OutPoint, Transaction, TxIn, TxOut},
     };
     use bitcoin::consensus::Decodable;
-    use bitcoin::hashes::Hash as _;
     use bitcoin::hashes::Hash;
+    use bitcoin::network::constants::ServiceFlags;
     use bitcoin::network::message::NetworkMessage;
 
     fn block(commitment: bool, witness: bool) -> Block {
@@ -883,5 +881,26 @@ mod tests {
             !AnyBlock::from(stripped).check_witnesses(),
             "a stripped block must not pass"
         );
+    }
+
+    /// The CVE-2012-2459 mutation: repeating the last transaction leaves the
+    /// header, the merkle root and the witness commitment all unchanged.
+    #[test]
+    fn a_block_with_its_last_transaction_repeated_is_refused() {
+        let mut second = spending_tx(true);
+        second.output[0].value = 2;
+        let mut honest = committing_block(vec![spending_tx(true), second], Some([0u8; 32]));
+        honest.header.merkle_root = honest.compute_merkle_root().expect("a root");
+        let mut mutated = honest.clone();
+        mutated.txdata.push(mutated.txdata.last().unwrap().clone());
+
+        let honest = AnyBlock::from(honest);
+        assert!(honest.check_merkle_root() && honest.check_witnesses());
+        assert!(honest.has_unique_txids());
+
+        let mutated = AnyBlock::from(mutated);
+        assert_eq!(mutated.block_hash(), honest.block_hash());
+        assert!(mutated.check_merkle_root() && mutated.check_witnesses());
+        assert!(!mutated.has_unique_txids());
     }
 }
